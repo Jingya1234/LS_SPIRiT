@@ -1,0 +1,116 @@
+clear
+%%
+currentFolder = pwd;
+addpath(genpath(currentFolder));
+%% 加载数据KSA21_24
+load('Slice24.mat')
+load('mask5_2.mat')
+%Kdata=squeeze(KSA21_24(:,:,1:16));	Kdata=squeeze(KSA21_24);	%√
+%%
+tic
+AcsSize = 24;
+fe = size(Kdata,1);
+pe = size(Kdata,2);
+coils = size(Kdata,3); 
+a1 = fe/2 - AcsSize/2;
+a2 = pe/2 - AcsSize/2;
+mask = double(mask);
+mask(a1:a1+AcsSize,a2:a2+AcsSize) = 1;
+phase_mask = zeros(fe,pe);
+phase_mask(a1:a1+AcsSize,a2:a2+AcsSize) = 1;
+IM11ph = ifft2c(KSA21_24(:,:,1:16))./abs(ifft2c(KSA21_24(:,:,1:16)));
+param.phase = phase_correct(KSA21_24(:,:,1:16), Kdata, IM11ph, phase_mask, a1, a2);
+%%
+imori=ifft2c(Kdata);
+im_ori_sos = sos(imori);
+im_ori = imori ./ max(im_ori_sos(:));
+im_ref = im_ori_sos ./ max(im_ori_sos(:));
+
+%% SPIRiT kernel
+kSize = [5,5];  % SPIRiT kernel size
+CalibTyk = 0.01;  % Tykhonov regularization in the calibration
+[CalibSize, dcomp] = getCalibSize(mask);
+DATA = Kdata.*repmat(mask,[1,1,coils]);
+DATAcomp = DATA.*repmat(dcomp,[1,1,coils]);
+scale_fctr = norm(DATAcomp(:))/sqrt(coils)/20;
+DATA = DATA/scale_fctr;
+imori = imori/scale_fctr;
+kCalib = crop(DATA,[CalibSize,coils]);
+kernel = zeros([kSize,coils,coils]);
+[AtA] = corrMatrix(kCalib,kSize);
+for n=1:coils
+	kernel(:,:,:,n) = calibrate(AtA,kSize,coils,n,CalibTyk);
+end
+GOP = SPIRiT(kernel, 'fft',[fe,pe]);
+%% Tight frame SIDWT paramters
+level = 4;
+wName = 'db4';
+psi = UWT(level, wName);
+
+%% 参数
+TV = TVOP;
+param.data = DATA;  
+param.mask = mask;
+param.GOP =  GOP;
+lamda1 = 0.002;
+lamda2 = 0.04;
+sgama1 = 0.675;
+sgama2 = 1;
+sgama3 = 1;
+lamdas = 0.0045;
+
+s2 = sgama1*lamda2;
+s4 = sgama3*lamda2;
+s1 = sgama1*lamda1;
+s3 = sgama2*lamda1;
+
+
+%%  初始化
+[xsize,ysize,ncoils] = size(DATA);
+v = zeros(xsize,ysize,ncoils,2);
+w = zeros(xsize,ysize,ncoils);
+x = DATA;
+x0 = DATA;
+tic,
+%% 迭代
+for k = 1:62
+   %% 低秩
+   z = R_LORAKS(x,fe,pe,coils);
+   aa = sgama1*(mask.*(mask.*x-DATA)) + fft2c(1i*imag(ifft2c(x).*conj(param.phase)).*(param.phase)) +lamdas*z;
+   dd = GOP'*w;
+   cc1 = TV'*v;
+   cc = fft2c(cc1);
+   x = x0 - aa -s2*dd - s1*cc;%加参数
+   b = ifft2c(x);
+   W_X = psi*(b);
+   X = psi'*(wthresh(W_X,'s',8e-5));
+   x = fft2c(X);  
+   ww=GOP*(2*x-x0);  
+   w = w+s4*ww;
+   w = w./(max(1,abs(w)));
+   TV_image = TV*(ifft2c(2*x - x0));
+   v = v + s3*TV_image;
+   v_abs = sqrt(v(:,:,:,1).^2+v(:,:,:,2).^2);
+   v_abs = max(1,v_abs);
+   v = v./repmat(v_abs,1,1,1,2);
+   x0 = x;
+   imshow(sos(ifft2c(x)),[])
+   drawnow;
+   k
+end
+toc
+im = sos(ifft2c(x));
+image1 = sos(ifft2c(x));
+image1 = (image1-max(image1(:)))./(max(image1(:))-min(image1(:)));
+image2 = sos(imori);
+image2 = (image2-max(image2(:)))./(max(image2(:))-min(image2(:)));
+image2 = double(image2);
+A = ssim(image1,image2);
+B = psnr(image1,image2);
+
+im_rec_show = sos(ifft2c(x));
+im_rec_show = im_rec_show ./ max(im_rec_show(:));
+rlne_pfista = rlne(im_ref, im_rec_show);%RLNE相对范数误差
+
+im = im*scale_fctr;
+figure(12),imshow(abs(im_rec_show - im_ref)*10);title('Error (10x)')
